@@ -1462,16 +1462,30 @@ export default class BaseStreamController
     const bufferInfo = BufferHelper.bufferInfo(bufferable, pos, maxBufferHole);
     // Workaround flaw in getting forward buffer when maxBufferHole is smaller than gap at current pos
     if (bufferInfo.len === 0 && bufferInfo.nextStart !== undefined) {
-      const bufferedFragAtPos = this.fragmentTracker.getBufferedFrag(pos, type);
-      if (
-        bufferedFragAtPos &&
-        (bufferInfo.nextStart <= bufferedFragAtPos.end || bufferedFragAtPos.gap)
-      ) {
-        const gapDuration = Math.max(
-          Math.min(bufferInfo.nextStart, bufferedFragAtPos.end) - pos,
-          maxBufferHole,
+      // While paused, or after a backward seek into an unbuffered region, keep
+      // the strict (zero-length) buffer info so that the fragment covering the
+      // playhead gets selected and (re)loaded. Bridging across the hole to a
+      // later buffered range here would make the controller treat the gap as
+      // already buffered and never fetch the missing segment (it would only be
+      // recovered once playback resumes and the gap-controller skips the hole).
+      const pausedOrBackwardSeek =
+        this.media?.paused || this.lastCurrentTime > pos;
+      if (!pausedOrBackwardSeek) {
+        const bufferedFragAtPos = this.fragmentTracker.getBufferedFrag(
+          pos,
+          type,
         );
-        return BufferHelper.bufferInfo(bufferable, pos, gapDuration);
+        if (
+          bufferedFragAtPos &&
+          (bufferInfo.nextStart <= bufferedFragAtPos.end ||
+            bufferedFragAtPos.gap)
+        ) {
+          const gapDuration = Math.max(
+            Math.min(bufferInfo.nextStart, bufferedFragAtPos.end) - pos,
+            maxBufferHole,
+          );
+          return BufferHelper.bufferInfo(bufferable, pos, gapDuration);
+        }
       }
     }
     return bufferInfo;

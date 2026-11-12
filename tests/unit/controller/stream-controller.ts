@@ -1544,4 +1544,168 @@ ${durations.map((duration, i) => `#EXTINF:${duration},\n${i}.ts`).join('\n')}
       });
     });
   });
+
+  describe('backward seek into a buffer hole while paused', function () {
+    const createFragment = (sn: number, start: number): MediaFragment => {
+      const frag = new Fragment(
+        PlaylistLevelType.MAIN,
+        `${sn}.ts`,
+      ) as MediaFragment;
+      frag.sn = sn;
+      frag.level = 0;
+      frag.url = frag.relurl = `${sn}.ts`;
+      frag.setStart(start);
+      frag.duration = 5;
+      return frag;
+    };
+
+    const setupLevel = (fragments: MediaFragment[]) => {
+      const details = new LevelDetails('');
+      details.live = true;
+      details.startSN = 0;
+      details.endSN = fragments.length - 1;
+      details.PTSKnown = true;
+      details.fragments = fragments;
+      const level = new Level({ name: '', url: '', attrs, bitrate: 500000 });
+      level.details = details;
+      streamController['levels'] = [level];
+      streamController['levelLastLoaded'] = level;
+      return { details, level };
+    };
+
+    const attachPausedMedia = (ranges: [number, number][]) => {
+      const media: any = {
+        readyState: 4,
+        seeking: false,
+        paused: true,
+        currentTime: 7,
+        buffered: new TimeRangesMock(...ranges),
+        addEventListener: sinon.stub(),
+        removeEventListener: sinon.stub(),
+      };
+      streamController['media'] = media;
+      streamController['mediaBuffer'] = media;
+      return media;
+    };
+
+    // Marks a fragment PARTIAL with only [start, start + 1] reaching the buffer,
+    // driving the real fragment-tracker event flow.
+    const markPartial = (
+      frag: MediaFragment,
+      appendedRanges: [number, number][],
+    ) => {
+      const timeRanges = new TimeRangesMock(...appendedRanges);
+      hls.trigger(Events.FRAG_LOADED, { frag } as any);
+      frag.setElementaryStreamInfo(
+        ElementaryStreamTypes.VIDEO,
+        frag.start,
+        frag.start + 1,
+        frag.start,
+        frag.start + 1,
+        true,
+      );
+      // Only the first second reached the buffer; the tracker uses these
+      // boundaries to classify the fragment as PARTIAL.
+      frag.minEndPTS = frag.start + 1;
+      frag.maxStartPTS = frag.start;
+      hls.trigger(Events.BUFFER_APPENDED, {
+        type: ElementaryStreamTypes.VIDEO,
+        frag,
+        part: null,
+        parent: PlaylistLevelType.MAIN,
+        timeRanges: { video: timeRanges },
+      } as any);
+      hls.trigger(Events.FRAG_BUFFERED, {
+        frag,
+        part: null,
+        id: PlaylistLevelType.MAIN,
+      } as any);
+    };
+
+    beforeEach(function () {
+      sinon.stub(hls, 'loadLevel').get(() => 0);
+      sinon
+        .stub(hls, 'nextLoadLevel')
+        .get(() => 0)
+        .set(() => {});
+      // After the initial start fragment the playhead reads media.currentTime
+      streamController['_hasEnoughToStart'] = true;
+      streamController['state'] = State.IDLE;
+    });
+
+    it('reloads the partially buffered fragment covering the hole while paused', function () {
+      const fragments = [0, 1, 2, 3, 4].map((sn) => createFragment(sn, sn * 5));
+      setupLevel(fragments);
+      // sn0 buffered, sn1 only partially buffered ([5,6]), sn2..sn4 buffered.
+      // The playhead (7s) sits in the unbuffered tail of sn1 (the hole).
+      const media = attachPausedMedia([
+        [0, 6],
+        [10, 25],
+      ]);
+      fragments
+        .filter((frag) => frag.sn !== 1)
+        .forEach((frag) => fragmentTracker.fragBuffered(frag, true));
+      markPartial(fragments[1], [[0, 6]]);
+      expect(fragmentTracker.getState(fragments[1])).to.equal(
+        FragmentState.PARTIAL,
+      );
+
+      // A backward seek leaves lastCurrentTime ahead of the playhead
+      streamController['lastCurrentTime'] = 20;
+      media.currentTime = 7;
+
+      // The strict buffer info must not bridge across the hole while paused
+      const bufferInfo = streamController['getMainFwdBufferInfo']();
+      expect(bufferInfo?.len).to.equal(0);
+      expect(bufferInfo?.nextStart).to.equal(10);
+
+      streamController['doTickIdle']();
+      expect(streamController['fragCurrent']?.sn).to.equal(1);
+      expect(streamController.state).to.equal(State.FRAG_LOADING);
+    });
+
+    it('loads a never-loaded fragment in the hole while paused', function () {
+      const fragments = [0, 1, 2, 3, 4].map((sn) => createFragment(sn, sn * 5));
+      setupLevel(fragments);
+      const media = attachPausedMedia([
+        [0, 5],
+        [10, 25],
+      ]);
+      fragments
+        .filter((frag) => frag.sn !== 1)
+        .forEach((frag) => fragmentTracker.fragBuffered(frag, true));
+      expect(fragmentTracker.getState(fragments[1])).to.equal(
+        FragmentState.NOT_LOADED,
+      );
+
+      streamController['lastCurrentTime'] = 20;
+      media.currentTime = 7;
+
+      streamController['doTickIdle']();
+      expect(streamController['fragCurrent']?.sn).to.equal(1);
+    });
+
+    it('still bridges across a partial fragment during forward playback', function () {
+      const fragments = [0, 1, 2, 3, 4].map((sn) => createFragment(sn, sn * 5));
+      setupLevel(fragments);
+      const media = attachPausedMedia([
+        [0, 6],
+        [10, 25],
+      ]);
+      media.paused = false;
+      fragments
+        .filter((frag) => frag.sn !== 1)
+        .forEach((frag) => fragmentTracker.fragBuffered(frag, true));
+      markPartial(fragments[1], [[0, 6]]);
+
+      // Forward playback: lastCurrentTime is behind the playhead
+      streamController['lastCurrentTime'] = 6.9;
+      media.currentTime = 7;
+
+      // Existing forward skip-hole behavior must be preserved
+      const bufferInfo = streamController['getMainFwdBufferInfo']();
+      expect(bufferInfo?.len).to.be.greaterThan(0);
+      expect(bufferInfo?.start).to.equal(10);
+    });
+  });
 });
